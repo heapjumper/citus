@@ -27,6 +27,7 @@
 #include "distributed/connection_management.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multi_router_executor.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/version_compat.h"
@@ -256,8 +257,6 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 	TaskExecStatus currentStatus = taskStatusArray[currentIndex];
 	List *taskPlacementList = task->taskPlacementList;
 	ShardPlacement *taskPlacement = list_nth(taskPlacementList, currentIndex);
-	char *nodeName = taskPlacement->nodeName;
-	uint32 nodePort = taskPlacement->nodePort;
 	ConnectAction connectAction = CONNECT_ACTION_NONE;
 
 	/* as most state transitions don't require blocking, default to not waiting */
@@ -268,13 +267,15 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 		case EXEC_TASK_CONNECT_START:
 		{
 			int32 connectionId = INVALID_CONNECTION_ID;
-			char *nodeDatabase = NULL;
+			List *relationShardList = task->relationShardList;
+			List *placementAccessList = NIL;
 
-			/* we use the same database name on the master and worker nodes */
-			nodeDatabase = get_database_name(MyDatabaseId);
+			/* create placement accesses for placements that appear in a subselect */
+			placementAccessList = BuildPlacementSelectList(taskPlacement->groupId,
+														   relationShardList);
 
-			connectionId = MultiClientConnectStart(nodeName, nodePort, nodeDatabase,
-												   NULL);
+			connectionId = MultiClientPlacementConnectStart(placementAccessList,
+															NULL);
 			connectionIdArray[currentIndex] = connectionId;
 
 			/* if valid, poll the connection until the connection is initiated */
@@ -349,6 +350,8 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 
 		case EXEC_TASK_FAILED:
 		{
+			bool raiseError = true;
+
 			/*
 			 * On task failure, we close the connection. We also reset our execution
 			 * status assuming that we might fail on all other worker nodes and come
@@ -356,6 +359,15 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 			 * and compute task(s) on this node again.
 			 */
 			int32 connectionId = connectionIdArray[currentIndex];
+			MultiConnection *connection = MultiClientGetConnection(connectionId);
+
+			/*
+			 * If this function was previously marked as critical (e.g. it was used
+			 * to perform a DDL command), then throw an error. Otherwise, mark it
+			 * as failed and continue executing the query.
+			 */
+			MarkRemoteTransactionFailed(connection, raiseError);
+
 			MultiClientDisconnect(connectionId);
 			connectionIdArray[currentIndex] = INVALID_CONNECTION_ID;
 			connectAction = CONNECT_ACTION_CLOSED;
@@ -579,7 +591,7 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 					taskStatusArray[currentIndex] = EXEC_TASK_DONE;
 
 					/* we are done executing; we no longer need the connection */
-					MultiClientDisconnect(connectionId);
+					MultiClientReleaseConnection(connectionId);
 					connectionIdArray[currentIndex] = INVALID_CONNECTION_ID;
 					connectAction = CONNECT_ACTION_CLOSED;
 				}
